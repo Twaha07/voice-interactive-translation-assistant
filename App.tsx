@@ -1,28 +1,39 @@
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import { SessionStatus, TranscriptionEntry } from './types';
-import { decode, encode, decodeAudioData, createBlob } from './utils';
+import { decode, decodeAudioData, createBlob } from './utils';
 import { VoiceVisualizer } from './components/VoiceVisualizer';
 
 const SYSTEM_INSTRUCTION = `
-You are the "Universal Polyglot Voice Menu." You support EVERY language globally.
-Your core workflow is strictly menu-driven:
-1. CAPTURE & CONFIRM: As soon as the user speaks, transcribe it and say: "I captured that as: '[text]'. What language would you like me to translate this into?"
-2. MENU PRESENTATION: List a few popular options (Spanish, French, Mandarin, Hindi, Arabic, German, Japanese, Portuguese, Russian) but state clearly: "I can translate into ANY language in the world. Just name it."
-3. EXECUTION: Once the user specifies a language, provide a high-quality, native-sounding translation.
-4. FOLLOW-UP: After translating, ask: "Would you like to try another language for this same phrase, or shall we start a new one?"
+You are the "Neural Polyglot Assistant." 
+Your workflow is strictly as follows:
+1. RECORDING PHASE: You listen silently while the user speaks.
+2. CONFIRMATION & OPTIONS: Immediately after the user finishes their phrase, you must say: "I've recorded that. Would you like me to translate it into Urdu, Telugu, Hindi, Kannada, Tamil, or any other language?"
+3. TRANSLATION PHASE: Once they provide a language name (e.g., "Telugu"), you perform the translation using a native-quality voice.
+4. FOLLOW-UP: After translating, ask: "Would you like another language for this same phrase, or should we record a new one?"
 
-Always maintain a professional, helpful, and clear tone. Use the specific native accent for the target translation.
+You support all global languages but prioritize listing Urdu, Telugu, Hindi, Kannada, and Tamil as the primary options. Be professional, sophisticated, and act as a high-end AI dashboard.
 `;
 
+const VOICES = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'];
+const INDIAN_LANGUAGES = ['Urdu', 'Telugu', 'Hindi', 'Kannada', 'Tamil'];
+
+const GOOGLE_ACCOUNTS = [
+  { name: 'Alex Thompson', email: 'alex.thompson@gmail.com', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Alex' },
+  { name: 'Developer User', email: 'dev.workspace@gmail.com', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Dev' },
+  { name: 'Guest Translator', email: 'guest.access@gmail.com', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=Guest' },
+];
+
 const App: React.FC = () => {
+  const [authStep, setAuthStep] = useState<'LOGIN' | 'SELECT_ACCOUNT' | 'DASHBOARD'>('LOGIN');
+  const [userProfile, setUserProfile] = useState<{name: string, email: string, avatar: string} | null>(null);
   const [status, setStatus] = useState<SessionStatus>(SessionStatus.IDLE);
   const [transcriptions, setTranscriptions] = useState<TranscriptionEntry[]>([]);
   const [isModelSpeaking, setIsModelSpeaking] = useState(false);
-  const [hasKey, setHasKey] = useState<boolean | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isSaving, setIsSaving] = useState(false);
+  const [selectedVoice, setSelectedVoice] = useState('Kore');
+  const [hasRecorded, setHasRecorded] = useState(false);
   
   const audioContextInRef = useRef<AudioContext | null>(null);
   const audioContextOutRef = useRef<AudioContext | null>(null);
@@ -31,30 +42,6 @@ const App: React.FC = () => {
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const transcriptionBufferRef = useRef({ input: '', output: '' });
   const streamRef = useRef<MediaStream | null>(null);
-
-  // Mandatory check for API key
-  useEffect(() => {
-    const checkKey = async () => {
-      try {
-        const selected = await (window as any).aistudio.hasSelectedApiKey();
-        setHasKey(selected);
-      } catch (e) {
-        console.error("Key check failed", e);
-        setHasKey(false);
-      }
-    };
-    checkKey();
-  }, []);
-
-  const handleSelectKey = async () => {
-    try {
-      await (window as any).aistudio.openSelectKey();
-      setHasKey(true); // Assume success per instructions
-      setErrorMessage(null);
-    } catch (e) {
-      console.error("Key selection failed", e);
-    }
-  };
 
   const cleanup = useCallback(() => {
     if (sessionRef.current) {
@@ -69,28 +56,44 @@ const App: React.FC = () => {
       try { source.stop(); } catch (e) {}
     });
     activeSourcesRef.current.clear();
+    
+    if (audioContextInRef.current) {
+      audioContextInRef.current.close().catch(() => {});
+      audioContextInRef.current = null;
+    }
+    if (audioContextOutRef.current) {
+      audioContextOutRef.current.close().catch(() => {});
+      audioContextOutRef.current = null;
+    }
+
     setStatus(SessionStatus.IDLE);
     setIsModelSpeaking(false);
+    setHasRecorded(false);
   }, []);
+
+  const handleStopSession = useCallback(() => {
+    cleanup();
+  }, [cleanup]);
 
   const handleStartSession = async () => {
     setErrorMessage(null);
-    if (!hasKey) {
-      handleSelectKey();
-      return;
-    }
-
     try {
       setStatus(SessionStatus.CONNECTING);
       
       // Initialize Audio Contexts
-      audioContextInRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      audioContextOutRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const audioContextIn = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      const audioContextOut = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
-      // Request Microphone
-      streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Ensure contexts are resumed (crucial for mic input)
+      await audioContextIn.resume();
+      await audioContextOut.resume();
+      
+      audioContextInRef.current = audioContextIn;
+      audioContextOutRef.current = audioContextOut;
 
-      // Initialize Gemini Live
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
@@ -98,7 +101,7 @@ const App: React.FC = () => {
           responseModalities: [Modality.AUDIO],
           systemInstruction: SYSTEM_INSTRUCTION,
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } },
           },
           outputAudioTranscription: {},
           inputAudioTranscription: {},
@@ -106,13 +109,15 @@ const App: React.FC = () => {
         callbacks: {
           onopen: () => {
             setStatus(SessionStatus.CONNECTED);
-            const source = audioContextInRef.current!.createMediaStreamSource(streamRef.current!);
-            const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
+            
+            const source = audioContextIn.createMediaStreamSource(stream);
+            const scriptProcessor = audioContextIn.createScriptProcessor(4096, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
               sessionPromise.then(session => {
+                // Only send if session is still active
                 if (session) {
                   session.sendRealtimeInput({ media: pcmBlob });
                 }
@@ -120,10 +125,9 @@ const App: React.FC = () => {
             };
             
             source.connect(scriptProcessor);
-            scriptProcessor.connect(audioContextInRef.current!.destination);
+            scriptProcessor.connect(audioContextIn.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle transcribing user and model
             if (message.serverContent?.inputTranscription) {
               transcriptionBufferRef.current.input += message.serverContent.inputTranscription.text;
             }
@@ -134,31 +138,34 @@ const App: React.FC = () => {
             if (message.serverContent?.turnComplete) {
               const input = transcriptionBufferRef.current.input;
               const output = transcriptionBufferRef.current.output;
-              if (input.trim()) setTranscriptions(prev => [...prev, { role: 'user', text: input, timestamp: Date.now() }]);
-              if (output.trim()) setTranscriptions(prev => [...prev, { role: 'model', text: output, timestamp: Date.now() }]);
+              if (input.trim()) {
+                setTranscriptions(prev => [...prev, { role: 'user', text: input, timestamp: Date.now() }]);
+                setHasRecorded(true); // Triggers the language menu
+              }
+              if (output.trim()) {
+                setTranscriptions(prev => [...prev, { role: 'model', text: output, timestamp: Date.now() }]);
+              }
               transcriptionBufferRef.current = { input: '', output: '' };
             }
 
-            // Playback generated audio
             const audioData = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (audioData) {
               setIsModelSpeaking(true);
-              const ctx = audioContextOutRef.current!;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              
-              const buffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(ctx.destination);
-              
-              source.onended = () => {
-                activeSourcesRef.current.delete(source);
-                if (activeSourcesRef.current.size === 0) setIsModelSpeaking(false);
-              };
-              
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += buffer.duration;
-              activeSourcesRef.current.add(source);
+              const ctx = audioContextOutRef.current;
+              if (ctx) {
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                const buffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ctx.destination);
+                source.onended = () => {
+                  activeSourcesRef.current.delete(source);
+                  if (activeSourcesRef.current.size === 0) setIsModelSpeaking(false);
+                };
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += buffer.duration;
+                activeSourcesRef.current.add(source);
+              }
             }
 
             if (message.serverContent?.interrupted) {
@@ -169,232 +176,256 @@ const App: React.FC = () => {
             }
           },
           onerror: (err: any) => {
-            console.error('Session error:', err);
-            if (err?.message?.includes('Requested entity was not found')) {
-              setErrorMessage("Invalid Project or Key. Re-selecting...");
-              handleSelectKey();
-            } else {
-              setErrorMessage(err?.message || "An unexpected error occurred.");
-            }
+            console.error("Session Error:", err);
             setStatus(SessionStatus.ERROR);
+            setErrorMessage("Voice interface link failed.");
           },
-          onclose: () => {
+          onclose: (e: any) => {
+            console.log("Session Closed:", e);
             cleanup();
           }
         }
       });
-
       sessionRef.current = await sessionPromise;
-
     } catch (error: any) {
-      console.error('Initialization failed:', error);
+      console.error("Init Error:", error);
       setStatus(SessionStatus.ERROR);
-      if (error?.message?.includes('Requested entity was not found')) {
-        handleSelectKey();
-      } else {
-        setErrorMessage("Microphone access or connection failed.");
-      }
+      setErrorMessage("Microphone access denied or connection failed.");
     }
   };
 
-  const handleStopSession = () => {
+  const handleLanguageSelect = (lang: string) => {
+    if (sessionRef.current) {
+      sessionRef.current.sendRealtimeInput({
+        text: `Translate that to ${lang}`
+      });
+    }
+  };
+
+  const selectAccount = (account: typeof GOOGLE_ACCOUNTS[0]) => {
+    setUserProfile(account);
+    setAuthStep('DASHBOARD');
+  };
+
+  const handleLogout = () => {
     cleanup();
+    setUserProfile(null);
+    setAuthStep('LOGIN');
   };
 
-  const handleSaveConversation = () => {
-    if (transcriptions.length === 0) return;
-    setIsSaving(true);
-    
-    try {
-      const content = transcriptions.map(t => {
-        const time = new Date(t.timestamp).toLocaleTimeString();
-        const role = t.role === 'user' ? 'YOU' : 'ASSISTANT';
-        return `[${time}] ${role}:\n${t.text}\n`;
-      }).join('\n');
-
-      const blob = new Blob([content], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `translation-history-${new Date().toISOString().split('T')[0]}.txt`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    } finally {
-      setTimeout(() => setIsSaving(false), 1000);
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-[#020617] text-slate-100 flex flex-col font-inter">
-      {/* Decorative background elements */}
-      <div className="fixed inset-0 overflow-hidden pointer-events-none opacity-20">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-500 blur-[120px] rounded-full" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-600 blur-[120px] rounded-full" />
+  // --- Auth Screens ---
+  if (authStep === 'LOGIN') {
+    return (
+      <div className="min-h-screen bg-[#020617] flex flex-col items-center justify-center p-6 text-center overflow-hidden">
+        <div className="absolute inset-0 pointer-events-none">
+          <div className="absolute top-[-20%] left-[-10%] w-[60%] h-[60%] bg-indigo-600/10 blur-[150px] rounded-full" />
+          <div className="absolute bottom-[-20%] right-[-10%] w-[60%] h-[60%] bg-blue-600/10 blur-[150px] rounded-full" />
+        </div>
+        <div className="relative z-10 w-full max-w-sm space-y-8 animate-in fade-in zoom-in duration-500">
+          <div className="w-24 h-24 bg-gradient-to-tr from-indigo-500 to-violet-600 rounded-[2.5rem] flex items-center justify-center shadow-[0_0_50px_rgba(99,102,241,0.5)] mx-auto">
+            <svg className="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+            </svg>
+          </div>
+          <div className="space-y-2">
+            <h1 className="text-4xl font-black tracking-tighter text-white">Polyglot</h1>
+            <p className="text-slate-400 text-sm font-medium">Neural Voice Translation Hub</p>
+          </div>
+          <button 
+            onClick={() => setAuthStep('SELECT_ACCOUNT')}
+            className="w-full py-4 px-6 bg-white hover:bg-slate-100 text-slate-900 font-bold rounded-2xl flex items-center justify-center gap-4 transition-all shadow-xl active:scale-[0.98]"
+          >
+            <svg className="w-5 h-5" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.66l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+            </svg>
+            Sign in with Google
+          </button>
+        </div>
       </div>
+    );
+  }
+
+  if (authStep === 'SELECT_ACCOUNT') {
+    return (
+      <div className="min-h-screen bg-[#020617] flex items-center justify-center p-6">
+        <div className="w-full max-w-md bg-white rounded-[2.5rem] overflow-hidden shadow-[0_20px_60px_rgba(0,0,0,0.4)] animate-in slide-in-from-bottom-8 duration-500">
+          <div className="p-10 text-center space-y-4">
+            <svg className="w-12 h-12 mx-auto" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.66l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+            </svg>
+            <h2 className="text-2xl font-black text-slate-900 tracking-tight">Choose Account</h2>
+          </div>
+          <div className="border-t border-slate-50">
+            {GOOGLE_ACCOUNTS.map((acc) => (
+              <button 
+                key={acc.email}
+                onClick={() => selectAccount(acc)}
+                className="w-full flex items-center gap-4 p-6 text-left hover:bg-slate-50 transition-colors border-b border-slate-50 last:border-0 group"
+              >
+                <img src={acc.avatar} alt={acc.name} className="w-12 h-12 rounded-full border-2 border-slate-100 group-hover:border-indigo-400 transition-colors" />
+                <div className="flex-grow">
+                  <p className="font-bold text-slate-900 text-sm">{acc.name}</p>
+                  <p className="text-slate-500 text-xs font-medium">{acc.email}</p>
+                </div>
+              </button>
+            ))}
+          </div>
+          <div className="p-6 bg-slate-50/50 text-center">
+             <button onClick={() => setAuthStep('LOGIN')} className="text-slate-400 text-[10px] font-black hover:text-indigo-600 uppercase tracking-[0.2em]">Cancel</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Dashboard ---
+  return (
+    <div className="min-h-screen bg-[#020617] text-slate-100 flex flex-col font-inter overflow-hidden relative">
+      {/* Background Glow */}
+      <div className={`fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[100%] h-[100%] transition-all duration-1000 ${status === SessionStatus.CONNECTED ? 'bg-indigo-600/5' : 'bg-transparent'} blur-[200px] rounded-full pointer-events-none`} />
 
       {/* Nav */}
-      <nav className="relative z-10 w-full px-6 py-4 border-b border-slate-800/50 bg-slate-950/50 backdrop-blur-md">
-        <div className="max-w-6xl mx-auto flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-gradient-to-br from-indigo-500 to-blue-600 rounded-xl shadow-lg">
-              <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
-              </svg>
-            </div>
-            <span className="font-bold text-lg tracking-tight">Polyglot Menu</span>
+      <nav className="relative z-50 px-8 py-4 bg-slate-950/60 backdrop-blur-2xl border-b border-white/5 flex justify-between items-center">
+        <div className="flex items-center gap-4">
+          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-indigo-500/20 shadow-lg">
+            <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+            </svg>
           </div>
-          
-          <div className="flex items-center gap-4">
-            {status === SessionStatus.CONNECTED ? (
-              <span className="flex items-center gap-2 text-xs font-semibold text-green-400 bg-green-400/10 px-3 py-1 rounded-full border border-green-400/20">
-                <span className="w-2 h-2 bg-green-500 rounded-full animate-ping" />
-                Live: Mic Active
-              </span>
-            ) : (
-              <span className="text-xs font-medium text-slate-500">System Ready</span>
-            )}
+          <h1 className="text-sm font-black tracking-widest uppercase hidden sm:block">Polyglot Pro</h1>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3 px-3 py-1.5 bg-white/5 rounded-2xl border border-white/5">
+            <img src={userProfile?.avatar} className="w-6 h-6 rounded-full border border-white/10" alt="User" />
+            <div className="text-right">
+              <p className="text-[10px] font-black leading-none">{userProfile?.name}</p>
+              <button onClick={handleLogout} className="text-[8px] text-slate-500 hover:text-red-400 font-bold uppercase tracking-widest transition-colors">Logout</button>
+            </div>
           </div>
         </div>
       </nav>
 
-      <main className="relative z-10 flex-grow max-w-6xl w-full mx-auto p-4 md:p-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Controls Panel */}
-        <div className="lg:col-span-4 space-y-6">
-          <section className="bg-slate-900/60 border border-slate-800 p-6 rounded-[2rem] shadow-2xl backdrop-blur-sm">
-            <h2 className="text-sm font-bold text-slate-400 uppercase tracking-widest mb-6">Voice Control</h2>
-            
-            <div className="mb-8">
-              <VoiceVisualizer isActive={status === SessionStatus.CONNECTED} isModelSpeaking={isModelSpeaking} />
-            </div>
-
-            {!hasKey && (
-              <div className="mb-6 p-4 bg-amber-500/10 border border-amber-500/30 rounded-2xl">
-                <p className="text-xs text-amber-200/80 mb-3 leading-relaxed font-medium">
-                  Authentication required. Project billing must be enabled for Gemini 2.5 models.
-                </p>
-                <button 
-                  onClick={handleSelectKey}
-                  className="w-full py-2 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold rounded-xl transition-all shadow-lg shadow-amber-600/20"
-                >
-                  Configure API Key
-                </button>
-              </div>
-            )}
-
-            {errorMessage && (
-              <div className="mb-6 p-4 bg-red-500/10 border border-red-500/30 rounded-2xl">
-                <p className="text-xs text-red-400 font-medium leading-relaxed">{errorMessage}</p>
-              </div>
-            )}
-
-            <div className="space-y-4">
-              {status === SessionStatus.CONNECTED ? (
-                <button
-                  onClick={handleStopSession}
-                  className="w-full py-4 bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 transition-all rounded-2xl font-bold text-red-400 flex items-center justify-center gap-3 group"
-                >
-                  <div className="w-2 h-2 bg-red-500 rounded-full group-hover:scale-125 transition-transform" />
-                  Stop Recording
-                </button>
-              ) : (
-                <button
-                  onClick={handleStartSession}
-                  disabled={status === SessionStatus.CONNECTING || !hasKey}
-                  className="w-full py-5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 hover:to-blue-500 disabled:opacity-30 disabled:grayscale transition-all rounded-2xl font-bold text-white flex items-center justify-center gap-3 shadow-xl shadow-indigo-600/30 group active:scale-95"
-                >
-                  {status === SessionStatus.CONNECTING ? (
-                    <div className="flex gap-1.5 items-center">
-                      <div className="w-2 h-2 bg-white rounded-full animate-bounce" />
-                      <div className="w-2 h-2 bg-white rounded-full animate-bounce [animation-delay:0.2s]" />
-                      <div className="w-2 h-2 bg-white rounded-full animate-bounce [animation-delay:0.4s]" />
-                    </div>
-                  ) : (
-                    <>
-                      <svg className="w-6 h-6 group-hover:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                      </svg>
-                      Start Translation
-                    </>
-                  )}
-                </button>
+      <main className="flex-grow flex flex-col items-center justify-center p-6 relative z-10">
+        <div className="max-w-4xl w-full flex flex-col items-center gap-12">
+          
+          {/* Main Control Center */}
+          <div className="flex flex-col items-center gap-8 w-full animate-in fade-in slide-in-from-bottom-8 duration-700">
+            <div className="relative">
+              {status === SessionStatus.CONNECTED && (
+                <div className="absolute inset-0 -m-6 bg-indigo-500/20 rounded-full animate-ping opacity-20 pointer-events-none" />
               )}
+              
+              <button
+                onClick={status === SessionStatus.CONNECTED ? handleStopSession : handleStartSession}
+                disabled={status === SessionStatus.CONNECTING}
+                className={`w-40 h-40 rounded-full flex items-center justify-center transition-all duration-500 shadow-[0_20px_60px_rgba(0,0,0,0.5)] relative z-10 border-4 ${
+                  status === SessionStatus.CONNECTED 
+                    ? 'bg-red-500 border-red-400 hover:bg-red-600 scale-110 active:scale-105' 
+                    : 'bg-indigo-600 border-indigo-500 hover:bg-indigo-500 scale-100 hover:scale-105 active:scale-95 shadow-indigo-500/30'
+                } disabled:opacity-50 group`}
+              >
+                {status === SessionStatus.CONNECTING ? (
+                  <div className="w-12 h-12 border-4 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : status === SessionStatus.CONNECTED ? (
+                  <svg className="w-14 h-14 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                ) : (
+                  <svg className="w-14 h-14 text-white group-hover:scale-110 transition-transform" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                  </svg>
+                )}
+              </button>
             </div>
-            
-            <div className="mt-8 pt-6 border-t border-slate-800/50">
-              <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] mb-4 text-center">How it works</h3>
-              <div className="flex justify-between gap-2">
-                {[
-                  { step: "1", label: "Speak" },
-                  { step: "2", label: "Pick Lang" },
-                  { step: "3", label: "Result" }
-                ].map((s, i) => (
-                  <div key={i} className="flex flex-col items-center gap-2">
-                    <div className="w-8 h-8 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-[10px] font-bold">
-                      {s.step}
-                    </div>
-                    <span className="text-[9px] text-slate-500 font-bold uppercase">{s.label}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </section>
 
-          <section className="p-6 bg-slate-900/40 rounded-3xl border border-slate-800/50">
-             <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-3">Global Menu</h3>
-             <p className="text-[11px] text-slate-400 leading-relaxed italic">
-               The system is programmed to support every language including Arabic, Hindi, Japanese, Swahili, Tamil, and more. Just say the language name when prompted.
-             </p>
-          </section>
-        </div>
-
-        {/* Conversation Feed */}
-        <div className="lg:col-span-8 flex flex-col min-h-[500px]">
-          <div className="bg-slate-900/60 border border-slate-800 rounded-[2rem] flex-grow flex flex-col shadow-2xl backdrop-blur-sm overflow-hidden">
-            <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/80">
-              <h2 className="text-sm font-bold text-slate-400 uppercase tracking-widest">Transcription Feed</h2>
-              <div className="flex items-center gap-4">
-                {transcriptions.length > 0 && (
-                  <>
-                    <button 
-                      onClick={handleSaveConversation}
-                      disabled={isSaving}
-                      className={`text-xs font-bold transition-all uppercase tracking-widest flex items-center gap-2 ${isSaving ? 'text-green-400' : 'text-slate-400 hover:text-indigo-400'}`}
-                    >
-                      <svg className={`w-4 h-4 ${isSaving ? 'animate-bounce' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-                      </svg>
-                      {isSaving ? 'Saving...' : 'Save'}
-                    </button>
-                    <div className="w-px h-4 bg-slate-800" />
-                    <button 
-                      onClick={() => setTranscriptions([])}
-                      className="text-xs font-bold text-slate-500 hover:text-red-400 transition-colors uppercase tracking-widest flex items-center gap-2"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                      Clear
-                    </button>
-                  </>
+            <div className="w-full max-w-lg text-center space-y-4">
+              <VoiceVisualizer isActive={status === SessionStatus.CONNECTED} isModelSpeaking={isModelSpeaking} />
+              <div className="h-4">
+                {errorMessage ? (
+                  <p className="text-red-400 text-[10px] font-black uppercase tracking-widest animate-pulse">{errorMessage}</p>
+                ) : (
+                  <p className="text-slate-500 text-[10px] font-black uppercase tracking-[0.6em]">
+                    {status === SessionStatus.CONNECTED 
+                      ? (isModelSpeaking ? "Neural Processing..." : "Ready to Translate") 
+                      : "Tap to establish connection"}
+                  </p>
                 )}
               </div>
             </div>
+          </div>
 
-            <div className="flex-grow overflow-y-auto p-6 space-y-6 scroll-smooth scrollbar-hide">
-              {transcriptions.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-slate-600">
-                  <div className="w-20 h-20 border-2 border-dashed border-slate-800 rounded-full flex items-center justify-center mb-6">
-                    <svg className="w-10 h-10 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-                    </svg>
-                  </div>
-                  <p className="text-sm font-medium tracking-wide">Press Start and speak naturally</p>
-                  <p className="text-[10px] uppercase mt-2 opacity-50">Translation will appear here</p>
+          {/* Languages Menu - Appears when transcription is captured */}
+          <div className={`w-full max-w-3xl transition-all duration-700 transform ${hasRecorded && status === SessionStatus.CONNECTED ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-12 scale-95 pointer-events-none'}`}>
+            <div className="bg-slate-900/40 backdrop-blur-3xl border border-white/10 p-10 rounded-[3.5rem] shadow-2xl relative overflow-hidden">
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-indigo-500/50 to-transparent" />
+              <h2 className="text-center text-[12px] font-black uppercase tracking-[0.4em] text-indigo-400 mb-10">Select Target Language</h2>
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">
+                {INDIAN_LANGUAGES.map(lang => (
+                  <button
+                    key={lang}
+                    onClick={() => handleLanguageSelect(lang)}
+                    className="group flex flex-col items-center gap-4 p-5 rounded-[2rem] bg-white/5 border border-white/5 hover:bg-indigo-600 hover:border-indigo-400 transition-all active:scale-95 hover:-translate-y-1"
+                  >
+                    <div className="w-12 h-12 rounded-2xl bg-white/10 flex items-center justify-center text-xl font-bold group-hover:bg-white/20 transition-colors shadow-lg">
+                      {lang[0]}
+                    </div>
+                    <span className="text-[10px] font-black uppercase tracking-widest">{lang}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Recent Transcriptions - Floating bubbles */}
+          <div className="w-full max-w-2xl flex flex-col gap-3 px-4 max-h-[160px] overflow-y-auto scrollbar-hide opacity-60">
+            {transcriptions.slice(-3).reverse().map((t, i) => (
+              <div key={i} className={`flex ${t.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2`}>
+                <div className={`px-5 py-2.5 rounded-2xl text-[11px] font-medium tracking-wide ${t.role === 'user' ? 'bg-indigo-500/10 text-indigo-200 border border-indigo-500/20' : 'bg-slate-800 text-slate-400 border border-white/5'}`}>
+                  {t.text}
                 </div>
-              ) : (
-                transcriptions.map((t, i) => (
-                  <div key={i} className={`flex flex-col ${t.role === 'user' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-2`}>
-                    <div className={`max-w-[85%] rounded-[1.5rem] px-5 py-4 ${
-                      
+              </div>
+            ))}
+          </div>
+        </div>
+      </main>
+
+      {/* Side Voice Settings */}
+      <div className="fixed bottom-10 left-10 hidden xl:flex flex-col gap-3 group">
+         <span className="text-[9px] font-black text-slate-700 uppercase tracking-[0.3em] ml-2">Synthesis Aura</span>
+         <div className="flex flex-col gap-1.5 p-3 bg-slate-900/60 backdrop-blur-xl rounded-[2rem] border border-white/10 shadow-2xl">
+           {VOICES.map(v => (
+             <button 
+               key={v}
+               onClick={() => setSelectedVoice(v)}
+               className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all ${selectedVoice === v ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20' : 'text-slate-500 hover:bg-white/5 hover:text-slate-300'}`}
+             >
+               {v}
+             </button>
+           ))}
+         </div>
+      </div>
+
+      <footer className="px-10 py-5 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between text-[10px] text-slate-700 font-black uppercase tracking-[0.4em] bg-slate-950/20 gap-4">
+        <div className="flex items-center gap-10">
+          <div className="flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${status === SessionStatus.CONNECTED ? 'bg-green-500 shadow-[0_0_8px_#22c55e]' : 'bg-slate-800'}`} />
+            <span>Connection: {status}</span>
+          </div>
+          <span className="opacity-20 hidden sm:inline">|</span>
+          <span>Sample Rate: 16k Input / 24k Output</span>
+        </div>
+        <div className="flex items-center gap-6 text-slate-800">
+           <span>Neural Core v2.5</span>
+           <span>Polyglot Protocol Active</span>
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
