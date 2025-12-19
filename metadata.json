@@ -1,0 +1,7 @@
+{
+  "name": "Polyglot Voice Menu",
+  "description": "A sophisticated voice-interactive translation assistant that uses Gemini Live to identify your speech and prompt you for target translation languages via an intuitive voice menu.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
